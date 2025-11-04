@@ -1,9 +1,10 @@
-// Google auth + Drive upload + Sheets append with Shared Drive preflight
+// google.ts — JWT auth, Drive (Shared Drive), Sheets append with quoted sheet name
 const GOOGLE_CLIENT_EMAIL = Deno.env.get("GOOGLE_CLIENT_EMAIL") ?? "";
 const GOOGLE_PRIVATE_KEY = (Deno.env.get("GOOGLE_PRIVATE_KEY") ?? "").replace(/\\n/g, "\n");
 
 let cachedToken: { token: string; exp: number } | null = null;
 
+// --- tiny utils
 function b64url(input: Uint8Array): string {
   return btoa(String.fromCharCode(...input)).replace(/=+$/,"").replace(/\+/g,"-").replace(/\//g,"_");
 }
@@ -23,15 +24,17 @@ async function jwtSignRS256(header: object, claim: object): Promise<string> {
   return `${data}.${b64url(new Uint8Array(sig))}`;
 }
 
+// --- OAuth2
 export async function createAccessToken(): Promise<string> {
   const now = Math.floor(Date.now()/1000);
   if (cachedToken && cachedToken.exp - 60 > now) return cachedToken.token;
+
   const scope = [
-    // широкие скоупы, нужны для Shared Drives
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/spreadsheets",
   ].join(" ");
+
   const claim = { iss: GOOGLE_CLIENT_EMAIL, scope, aud: "https://oauth2.googleapis.com/token", iat: now, exp: now+3600 };
   const jwt = await jwtSignRS256({ alg: "RS256", typ: "JWT" }, claim);
 
@@ -46,28 +49,20 @@ export async function createAccessToken(): Promise<string> {
   return j.access_token as string;
 }
 
-// --- Drive helpers ---
+// --- Drive helpers
 async function driveGetFile(args: { accessToken: string; fileId: string }) {
-  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${args.fileId}?fields=id,name,driveId,mimeType,parents&supportsAllDrives=true`, {
-    headers: { Authorization: `Bearer ${args.accessToken}` }
-  });
-  if (!res.ok) {
-    const t = await res.text();
-    throw new Error(`drive get file error: ${res.status} ${t}`);
-  }
+  const res = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${args.fileId}?fields=id,name,driveId,mimeType,parents&supportsAllDrives=true`,
+    { headers: { Authorization: `Bearer ${args.accessToken}` } }
+  );
+  if (!res.ok) throw new Error(`drive get file error: ${res.status} ${await res.text()}`);
   return await res.json() as { id:string; name:string; driveId?:string; mimeType:string; parents?:string[] };
 }
 
 export async function ensureSharedFolder(args: { accessToken: string; folderId: string }) {
   const meta = await driveGetFile({ accessToken: args.accessToken, fileId: args.folderId });
-  // Папка в Shared Drive имеет driveId. В "My Drive" driveId пустой -> будет 403 по квоте.
-  if (!meta.driveId) {
-    throw new Error(`Folder ${args.folderId} is not in a Shared Drive. Move it into a Shared Drive and add the service account as Content manager.`);
-  }
-  // mimeType должен быть папкой
-  if (meta.mimeType !== "application/vnd.google-apps.folder") {
-    throw new Error(`File ${args.folderId} is not a folder.`);
-  }
+  if (!meta.driveId) throw new Error(`Folder ${args.folderId} is not in a Shared Drive.`);
+  if (meta.mimeType !== "application/vnd.google-apps.folder") throw new Error(`File ${args.folderId} is not a folder.`);
 }
 
 export async function driveUpload(args: { accessToken: string; folderId: string; name: string; mimeType: string; bytes: Uint8Array; }) {
@@ -83,32 +78,41 @@ export async function driveUpload(args: { accessToken: string; folderId: string;
     `--${boundary}--`
   ], { type: "multipart/related; boundary="+boundary });
 
-  const res = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${args.accessToken}` },
-    body,
-  });
+  const res = await fetch(
+    "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true",
+    { method: "POST", headers: { Authorization: `Bearer ${args.accessToken}` }, body }
+  );
   const j = await res.json();
   if (!res.ok) throw new Error(`drive upload error: ${res.status} ${JSON.stringify(j)}`);
   return j; // { id, name, ... }
 }
 
 export async function driveMakePublic(args: { accessToken: string; fileId: string; }) {
-  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${args.fileId}/permissions?supportsAllDrives=true`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${args.accessToken}`, "content-type": "application/json" },
-    body: JSON.stringify({ role: "reader", type: "anyone" }),
-  });
-  if (!res.ok) { const t = await res.text(); throw new Error(`drive perm error: ${res.status} ${t}`); }
+  const res = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${args.fileId}/permissions?supportsAllDrives=true`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${args.accessToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ role: "reader", type: "anyone" }),
+    }
+  );
+  if (!res.ok) throw new Error(`drive perm error: ${res.status} ${await res.text()}`);
 }
 
-// --- Sheets ---
+// --- Sheets (имя листа всегда в кавычках)
 export async function sheetsAppend(args: { accessToken: string; spreadsheetId: string; sheetName: string; values: any[][] }) {
-  const range = encodeURIComponent(`${args.sheetName}!A:H`);
-  const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${args.spreadsheetId}/values/${range}:append?valueInputOption=USER_ENTERED`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${args.accessToken}`, "content-type": "application/json" },
-    body: JSON.stringify({ values: args.values }),
-  });
-  if (!res.ok) { const t = await res.text(); throw new Error(`sheets append error: ${res.status} ${t}`); }
+  // экранируем одиночные кавычки и оборачиваем имя листа в '...'
+  const escaped = args.sheetName.replace(/'/g, "''");
+  const rangeA1 = `'${escaped}'!A:H`;
+  const range = encodeURIComponent(rangeA1);
+
+  const res = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${args.spreadsheetId}/values/${range}:append?valueInputOption=USER_ENTERED`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${args.accessToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ values: args.values }),
+    }
+  );
+  if (!res.ok) throw new Error(`sheets append error: ${res.status} ${await res.text()}`);
 }
