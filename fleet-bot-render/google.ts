@@ -1,4 +1,4 @@
-// Minimal JWT auth + Drive upload + Sheets append (Shared Drive ready)
+// Google auth + Drive upload + Sheets append with Shared Drive preflight
 const GOOGLE_CLIENT_EMAIL = Deno.env.get("GOOGLE_CLIENT_EMAIL") ?? "";
 const GOOGLE_PRIVATE_KEY = (Deno.env.get("GOOGLE_PRIVATE_KEY") ?? "").replace(/\\n/g, "\n");
 
@@ -27,6 +27,7 @@ export async function createAccessToken(): Promise<string> {
   const now = Math.floor(Date.now()/1000);
   if (cachedToken && cachedToken.exp - 60 > now) return cachedToken.token;
   const scope = [
+    // широкие скоупы, нужны для Shared Drives
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/spreadsheets",
@@ -45,8 +46,31 @@ export async function createAccessToken(): Promise<string> {
   return j.access_token as string;
 }
 
+// --- Drive helpers ---
+async function driveGetFile(args: { accessToken: string; fileId: string }) {
+  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${args.fileId}?fields=id,name,driveId,mimeType,parents&supportsAllDrives=true`, {
+    headers: { Authorization: `Bearer ${args.accessToken}` }
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`drive get file error: ${res.status} ${t}`);
+  }
+  return await res.json() as { id:string; name:string; driveId?:string; mimeType:string; parents?:string[] };
+}
+
+export async function ensureSharedFolder(args: { accessToken: string; folderId: string }) {
+  const meta = await driveGetFile({ accessToken: args.accessToken, fileId: args.folderId });
+  // Папка в Shared Drive имеет driveId. В "My Drive" driveId пустой -> будет 403 по квоте.
+  if (!meta.driveId) {
+    throw new Error(`Folder ${args.folderId} is not in a Shared Drive. Move it into a Shared Drive and add the service account as Content manager.`);
+  }
+  // mimeType должен быть папкой
+  if (meta.mimeType !== "application/vnd.google-apps.folder") {
+    throw new Error(`File ${args.folderId} is not a folder.`);
+  }
+}
+
 export async function driveUpload(args: { accessToken: string; folderId: string; name: string; mimeType: string; bytes: Uint8Array; }) {
-  // parents=[shared-drive-folder-id], supportsAllDrives=true
   const metadata = { name: args.name, parents: [args.folderId] };
   const boundary = "deno-"+crypto.randomUUID();
   const body = new Blob([
@@ -66,7 +90,7 @@ export async function driveUpload(args: { accessToken: string; folderId: string;
   });
   const j = await res.json();
   if (!res.ok) throw new Error(`drive upload error: ${res.status} ${JSON.stringify(j)}`);
-  return j; // -> { id, name, ... }
+  return j; // { id, name, ... }
 }
 
 export async function driveMakePublic(args: { accessToken: string; fileId: string; }) {
@@ -78,6 +102,7 @@ export async function driveMakePublic(args: { accessToken: string; fileId: strin
   if (!res.ok) { const t = await res.text(); throw new Error(`drive perm error: ${res.status} ${t}`); }
 }
 
+// --- Sheets ---
 export async function sheetsAppend(args: { accessToken: string; spreadsheetId: string; sheetName: string; values: any[][] }) {
   const range = encodeURIComponent(`${args.sheetName}!A:H`);
   const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${args.spreadsheetId}/values/${range}:append?valueInputOption=USER_ENTERED`, {
