@@ -1,4 +1,4 @@
-// Render-ready Telegram bot: questionnaire → Google Sheets; invoice → Google Drive
+// main.ts — Render-ready Telegram bot with blocking server + unit-type flow
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createAccessToken, driveUpload, driveMakePublic, sheetsAppend } from "./google.ts";
 
@@ -14,9 +14,22 @@ const PUBLIC_LINK = (Deno.env.get("PUBLIC_LINK") ?? "true").toLowerCase() === "t
 const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET") ?? "";
 const PORT = Number(Deno.env.get("PORT") ?? "8080");
 
-// ---- simple state
-type Step = "asset"|"repair"|"paidby"|"total"|"notes"|"invoice"|"done";
-type Draft = { asset?: string; repair?: string; paidBy?: "driver"|"company"; total?: string; comments?: string; };
+// ---- state
+type Step =
+  | "unitType" | "unitNumber" | "linkTruck"
+  | "repair" | "paidby" | "total" | "notes" | "invoice" | "done";
+
+type Draft = {
+  asset?: string;
+  assetType?: "truck" | "trailer";
+  truckNo?: string;
+  trailerNo?: string;
+  repair?: string;
+  paidBy?: "driver"|"company";
+  total?: string;
+  comments?: string;
+};
+
 const state = new Map<number, { step: Step; draft: Draft }>();
 const seenUpdates = new Set<number>();
 
@@ -45,25 +58,71 @@ async function send(chatId: number, text: string, keyboard?: any) {
     body: JSON.stringify(body),
   });
 }
+
+// keyboards
 const kbDashboard = () => ({ inline_keyboard: [[{ text: "Open Dashboard", url: DASHBOARD_URL }]] });
 const kbPaidBy = () => ({ keyboard: [[{text:"driver"},{text:"company"}]], resize_keyboard: true, one_time_keyboard: true, selective: true });
+const kbUnitType = () => ({ keyboard: [[{text:"truck"},{text:"trailer"}]], resize_keyboard: true, one_time_keyboard: true, selective: true });
+
+function buildAsset(d: Draft): string {
+  if (d.assetType === "truck" && d.truckNo) return `truck ${d.truckNo}`;
+  if (d.assetType === "trailer" && d.trailerNo && d.truckNo) return `TRL ${d.trailerNo} (unit ${d.truckNo})`;
+  if (d.assetType === "trailer" && d.trailerNo) return `TRL ${d.trailerNo}`;
+  return d.asset ?? "";
+}
+
+async function startFlow(chatId: number) {
+  state.set(chatId, { step: "unitType", draft: {} });
+  await send(chatId, "New report.\nChoose <b>Unit</b>:", kbUnitType());
+  await send(chatId, " ", kbDashboard()); // показывает кнопку Dashboard под первым сообщением
+}
 
 async function handleText(chatId: number, from: any, text: string) {
   const isStart = /^\/start|^new report$/i.test(text.trim());
-  const st = state.get(chatId) ?? { step: "asset" as Step, draft: {} };
+  const st = state.get(chatId) ?? { step: "unitType" as Step, draft: {} };
+
   if (isStart || st.step === "done") {
-    state.set(chatId, { step: "asset", draft: {} });
-    await send(chatId, "New report.\nSend <b>Asset</b> (e.g. <code>TRL 8034 (unit 5975)</code> or <code>truck 5626</code>).", kbDashboard());
+    await startFlow(chatId);
     return;
   }
   if (!isAllowed(chatId)) { await send(chatId, "Access denied for this chat."); return; }
 
   switch (st.step) {
-    case "asset":
-      st.draft.asset = text.trim();
+    case "unitType": {
+      const v = text.trim().toLowerCase();
+      if (v !== "truck" && v !== "trailer") {
+        await send(chatId, "Choose Unit: truck or trailer.", kbUnitType());
+        return;
+      }
+      st.draft.assetType = v as "truck"|"trailer";
+      st.step = "unitNumber"; state.set(chatId, st);
+      await send(chatId, v === "truck" ? "Enter <b>truck #</b>." : "Enter <b>trailer #</b>.");
+      break;
+    }
+    case "unitNumber": {
+      const num = text.trim();
+      if (!num) { await send(chatId, "Enter a valid number."); return; }
+      if (st.draft.assetType === "truck") {
+        st.draft.truckNo = num;
+        st.draft.asset = buildAsset(st.draft);
+        st.step = "repair"; state.set(chatId, st);
+        await send(chatId, "Describe the <b>issue</b> (Repair).");
+      } else {
+        st.draft.trailerNo = num;
+        st.step = "linkTruck"; state.set(chatId, st);
+        await send(chatId, "Truck # <b>connected with this trailer</b>?");
+      }
+      break;
+    }
+    case "linkTruck": {
+      const num = text.trim();
+      if (!num) { await send(chatId, "Enter truck #."); return; }
+      st.draft.truckNo = num;
+      st.draft.asset = buildAsset(st.draft);
       st.step = "repair"; state.set(chatId, st);
       await send(chatId, "Describe the <b>issue</b> (Repair).");
       break;
+    }
     case "repair":
       st.draft.repair = text.trim();
       st.step = "paidby"; state.set(chatId, st);
@@ -110,6 +169,7 @@ async function handleFile(chatId: number, from: any, msg: any) {
   }
   if (!fileId) { await send(chatId, "Unsupported file. Send a photo or a document (PDF/JPG/PNG)."); return; }
 
+  // Telegram file URL
   const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getFile`, {
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ file_id: fileId }),
   });
@@ -118,22 +178,29 @@ async function handleFile(chatId: number, from: any, msg: any) {
   const filePath = jr.result.file_path as string;
   const tgFileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
 
+  // Download
   const fileRes = await fetch(tgFileUrl);
   const ab = await fileRes.arrayBuffer();
   const bytes = new Uint8Array(ab);
 
+  // Upload to Drive
   const token = await createAccessToken();
   const driveFile = await driveUpload({
     accessToken: token, folderId: DRIVE_FOLDER_ID,
     name: `${chatId}-${Date.now()}-${originalName}`,
     mimeType: msg.document?.mime_type || "image/jpeg", bytes,
   });
-  let link = `https://drive.google.com/file/d/${driveFile.id}/view`;
   if (PUBLIC_LINK) { try { await driveMakePublic({ accessToken: token, fileId: driveFile.id }); } catch {} }
+  const link = `https://drive.google.com/file/d/${driveFile.id}/view`;
 
-  const draft = st.draft; const date = fmtDate(TIMEZONE); const reportedBy = usernameOf(from);
-  const values = [[ date, draft.asset ?? "", draft.repair ?? "", draft.total ?? "",
-                    draft.paidBy ?? "", reportedBy, link, draft.comments ?? "" ]];
+  // Append to Sheets
+  const d = st.draft;
+  const date = fmtDate(TIMEZONE);
+  const reportedBy = usernameOf(from);
+  const values = [[
+    date, buildAsset(d), d.repair ?? "", d.total ?? "",
+    d.paidBy ?? "", reportedBy, link, d.comments ?? ""
+  ]];
   await sheetsAppend({ accessToken: token, spreadsheetId: SPREADSHEET_ID, sheetName: SHEET_NAME, values });
 
   state.set(chatId, { step: "done", draft: {} });
@@ -146,6 +213,7 @@ async function handleUpdate(update: any) {
   const chatId = msg.chat?.id; if (typeof chatId !== "number") return;
   const from = msg.from;
 
+  // Groups: only on mention or reply-to-bot
   const isGroup = ["group","supergroup"].includes(msg.chat?.type);
   if (isGroup) {
     const text = msg.text ?? "";
@@ -153,10 +221,12 @@ async function handleUpdate(update: any) {
     const replyToBot = msg.reply_to_message?.from?.is_bot;
     if (!hasMention && !replyToBot) return;
   }
+
   if (msg.text) await handleText(chatId, from, msg.text);
   else if (msg.photo || msg.document) await handleFile(chatId, from, msg);
 }
 
+// HTTP
 async function httpHandler(req: Request): Promise<Response> {
   const url = new URL(req.url);
   if (url.pathname === "/webhook" && req.method === "POST") {
