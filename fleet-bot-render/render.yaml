@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: fleet-bot-deno
+    env: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /health
