@@ -1,8 +1,4 @@
 {
-  "tasks": {
-    "dev": "deno run -A --watch main.ts"
-  },
-  "deploy": {
-    "project": "fleet-bot-deno"
-  }
+  "tasks": { "dev": "deno run -A --watch main.ts" },
+  "deploy": { "entrypoint": "main.ts" }
 }
