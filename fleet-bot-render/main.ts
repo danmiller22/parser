@@ -1,6 +1,12 @@
-// main.ts — strict Google Drive upload, "Saving..." status, clean keyboards
+// main.ts — strict Drive upload, "Saving..." status, clean keyboards, append by sheetId
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
-import { createAccessToken, driveUpload, driveMakePublic, sheetsAppend } from "./google.ts";
+import {
+  createAccessToken,
+  driveUpload,
+  driveMakePublic,
+  sheetsAppendRow,
+  ensureSharedFolder,
+} from "./google.ts";
 
 // ENV
 const BOT_TOKEN = Deno.env.get("BOT_TOKEN") ?? "";
@@ -118,21 +124,19 @@ async function onText(chat:number, from:any, text:string){
 // ---- file
 async function onFile(chat:number, from:any, msg:any){
   const st=state.get(chat); if(!st || st.step!=="invoice") return;
-
   if(!DRIVE_FOLDER_ID){ await send(chat,"Config error: DRIVE_FOLDER_ID is empty."); return; }
 
-  // статус "Saving..."
   const mid = await sendGetId(chat,"Saving...");
 
   try{
-    // pick file_id
+    // select file
     let fileId:string|undefined, orig="invoice";
     if(msg.photo && Array.isArray(msg.photo) && msg.photo.length>0){
       const best=msg.photo[msg.photo.length-1]; fileId=best.file_id; orig="invoice.jpg";
     }else if(msg.document){ fileId=msg.document.file_id; orig=msg.document.file_name ?? "invoice.bin"; }
     if(!fileId){ await edit(chat,mid,"Unsupported file. Send a photo or a document (PDF/JPG/PNG)."); return; }
 
-    // getFile → download bytes
+    // getFile → download
     const gf=await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getFile`,{
       method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({file_id:fileId})
     });
@@ -143,6 +147,8 @@ async function onFile(chat:number, from:any, msg:any){
 
     // Drive upload (Shared Drive required)
     const token=await createAccessToken();
+    await ensureSharedFolder({ accessToken: token, folderId: DRIVE_FOLDER_ID });
+
     const mime=msg.document?.mime_type || "image/jpeg";
     const file=await driveUpload({
       accessToken:token, folderId:DRIVE_FOLDER_ID,
@@ -152,14 +158,19 @@ async function onFile(chat:number, from:any, msg:any){
     if(PUBLIC_LINK){ try{ await driveMakePublic({accessToken:token,fileId:file.id}); }catch(e){ console.warn("perm:",e); } }
     const link=`https://drive.google.com/file/d/${file.id}/view`;
 
-    // Append to Sheets
-    const d=st.draft; const values=[[ dstr(TIMEZONE), asset(d), d.repair??"", d.total??"", d.paidBy??"", uname(from), link, d.comments??"" ]];
-    await sheetsAppend({ accessToken:token, spreadsheetId:SPREADSHEET_ID, sheetName:SHEET_NAME, values });
+    // Append to Sheets (by sheetId)
+    const d=st.draft;
+    await sheetsAppendRow({
+      accessToken: token,
+      spreadsheetId: SPREADSHEET_ID,
+      sheetName: SHEET_NAME,
+      values: [ dstr(TIMEZONE), asset(d), d.repair??"", d.total??"", d.paidBy??"", uname(from), link, d.comments??"" ],
+    });
 
     state.set(chat,{step:"done",draft:{}});
     await edit(chat, mid, "Saved.");
-    await send(chat, "New report ready.", kbNew());  // reply-кнопка
-    await send(chat, " ", kbDash());                 // inline Dashboard
+    await send(chat, "New report ready.", kbNew());
+    await send(chat, " ", kbDash());
   }catch(e){
     console.error("upload error:", e);
     await edit(chat, mid, `Error while saving invoice: ${(e as Error).message}`);
