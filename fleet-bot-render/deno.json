@@ -1,1 +1,3 @@
-{"tasks":{"dev":"deno run -A main.ts"}}
+{
+  "tasks": { "dev": "deno run -A --watch main.ts" }
+}
