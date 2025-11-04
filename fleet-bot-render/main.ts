@@ -1,4 +1,4 @@
-// main.ts — Render-ready bot: unit-type flow + safe file handling
+// main.ts — Render-ready bot: unit-type flow + safe Drive/Sheets + clean keyboards
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createAccessToken, driveUpload, driveMakePublic, sheetsAppend } from "./google.ts";
 
@@ -24,12 +24,14 @@ type Draft = {
 const state = new Map<number, { step: Step; draft: Draft }>();
 const seenUpdates = new Set<number>();
 
-// ---- helpers
+// ---- keyboards
 const kbDashboard = () => ({ inline_keyboard: [[{ text: "Open Dashboard", url: DASHBOARD_URL }]] });
-const kbPaidBy = () => ({ keyboard: [[{text:"driver"},{text:"company"}]], resize_keyboard: true, one_time_keyboard: true, selective: true });
-const kbUnitType = () => ({ keyboard: [[{text:"truck"},{text:"trailer"}]], resize_keyboard: true, one_time_keyboard: true, selective: true });
+const kbPaidBy    = () => ({ keyboard: [[{text:"driver"},{text:"company"}]], resize_keyboard: true, one_time_keyboard: true, selective: true });
+const kbUnitType  = () => ({ keyboard: [[{text:"truck"},{text:"trailer"}]], resize_keyboard: true, one_time_keyboard: true, selective: true });
+const kbRemove    = () => ({ remove_keyboard: true });
 
-function isAllowed(chatId: number) { return ALLOWED_CHAT_IDS.length === 0 || ALLOWED_CHAT_IDS.includes(String(chatId)); }
+// ---- helpers
+function allowed(chatId: number) { return ALLOWED_CHAT_IDS.length === 0 || ALLOWED_CHAT_IDS.includes(String(chatId)); }
 function usernameOf(u: any) { return u?.username ? "@"+u.username : ((u?.first_name ?? "") + " " + (u?.last_name ?? "")).trim() || "unknown"; }
 function fmtDate(tz: string) { return new Intl.DateTimeFormat("en-US", { timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit" }).format(new Date()); }
 async function send(chatId: number, text: string, keyboard?: any) {
@@ -54,7 +56,7 @@ async function handleText(chatId: number, from: any, text: string) {
   const isStart = /^\/start|^new report$/i.test(text.trim());
   const st = state.get(chatId) ?? { step: "unitType" as Step, draft: {} };
   if (isStart || st.step === "done") { await startFlow(chatId); return; }
-  if (!isAllowed(chatId)) { await send(chatId, "Access denied for this chat."); return; }
+  if (!allowed(chatId)) { await send(chatId, "Access denied for this chat."); return; }
 
   switch (st.step) {
     case "unitType": {
@@ -62,7 +64,7 @@ async function handleText(chatId: number, from: any, text: string) {
       if (v !== "truck" && v !== "trailer") { await send(chatId, "Choose Unit: truck or trailer.", kbUnitType()); return; }
       st.draft.assetType = v as "truck"|"trailer";
       st.step = "unitNumber"; state.set(chatId, st);
-      await send(chatId, v === "truck" ? "Enter <b>truck #</b>." : "Enter <b>trailer #</b>.");
+      await send(chatId, v === "truck" ? "Enter <b>truck #</b>." : "Enter <b>trailer #</b>.", kbRemove());
       break;
     }
     case "unitNumber": {
@@ -95,7 +97,7 @@ async function handleText(chatId: number, from: any, text: string) {
       if (v !== "driver" && v !== "company") { await send(chatId, "Choose: driver or company.", kbPaidBy()); return; }
       st.draft.paidBy = v as any;
       st.step = "total"; state.set(chatId, st);
-      await send(chatId, "Total amount (e.g. 59.20).");
+      await send(chatId, "Total amount (e.g. 59.20).", kbRemove()); // remove keyboard
       break;
     }
     case "total": {
@@ -109,7 +111,8 @@ async function handleText(chatId: number, from: any, text: string) {
     case "notes":
       st.draft.comments = text.trim() === "-" ? "" : text.trim();
       st.step = "invoice"; state.set(chatId, st);
-      await send(chatId, "Send invoice (photo or PDF).", kbDashboard());
+      await send(chatId, "Send invoice (photo or PDF).", kbRemove());
+      await send(chatId, " ", kbDashboard());
       break;
     case "invoice":
       await send(chatId, "Waiting for a photo or document. Send file.");
@@ -121,6 +124,8 @@ async function handleText(chatId: number, from: any, text: string) {
 async function handleFile(chatId: number, from: any, msg: any) {
   const st = state.get(chatId);
   if (!st || st.step !== "invoice") return;
+
+  if (!DRIVE_FOLDER_ID) { await send(chatId, "Config error: DRIVE_FOLDER_ID is empty."); return; }
 
   try {
     let fileId: string|undefined;
