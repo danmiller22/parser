@@ -1,4 +1,4 @@
-// main.ts — strict Drive upload, "Saving..." status, clean keyboards, append by sheetId
+// main.ts — Drive upload only, "Saving..." status, auto Sheets by sheetId, home keyboard with New report + Dashboard
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import {
   createAccessToken,
@@ -35,7 +35,16 @@ const kbDash = () => ({ inline_keyboard: [[{ text: "Open Dashboard", url: DASHBO
 const kbPaid = () => ({ keyboard: [[{text:"driver"},{text:"company"}]], resize_keyboard:true, one_time_keyboard:true, selective:true });
 const kbUnit = () => ({ keyboard: [[{text:"truck"},{text:"trailer"}]], resize_keyboard:true, one_time_keyboard:true, selective:true });
 const kbRemove = () => ({ remove_keyboard: true });
-const kbNew = () => ({ keyboard: [[{text:"New report"}]], resize_keyboard:true, one_time_keyboard:true, selective:true });
+// Домашняя клавиатура: New report + Dashboard, ниже — выбор юнита
+const kbHome = () => ({
+  keyboard: [
+    [{ text: "New report" }, { text: "Dashboard" }],
+    [{ text: "truck" }, { text: "trailer" }],
+  ],
+  resize_keyboard: true,
+  one_time_keyboard: false,
+  selective: true,
+});
 
 // ---- helpers
 function allowed(id:number){ return ALLOWED_CHAT_IDS.length===0 || ALLOWED_CHAT_IDS.includes(String(id)); }
@@ -64,24 +73,31 @@ function asset(d:Draft){
 // ---- flow
 async function start(chat:number){
   state.set(chat,{step:"unitType",draft:{}});
-  await send(chat,"New report.\nChoose <b>Unit</b>:", kbUnit());
+  // Домашняя клавиатура сразу: New report + Dashboard + выбор юнита
+  await send(chat,"New report. Choose <b>Unit</b>:", kbHome());
+  // Дополнительно отдадим инлайн-кнопку к дашборду
   await send(chat," ", kbDash());
 }
 async function onText(chat:number, from:any, text:string){
-  const startCmd = /^\/start|^new report$/i.test(text.trim());
+  const t = text.trim();
+  const startCmd = /^\/start|^new report$/i.test(t);
+
+  // Быстрая обработка кнопки "Dashboard" из reply-клавиатуры
+  if (/^dashboard$/i.test(t)) { await send(chat, "Dashboard:", kbDash()); return; }
+
   const st = state.get(chat) ?? {step:"unitType" as Step, draft:{}};
   if(startCmd || st.step==="done"){ await start(chat); return; }
   if(!allowed(chat)){ await send(chat,"Access denied for this chat."); return; }
 
   switch(st.step){
     case "unitType":{
-      const v=text.trim().toLowerCase();
-      if(v!=="truck" && v!=="trailer"){ await send(chat,"Choose Unit: truck or trailer.", kbUnit()); return; }
+      const v=t.toLowerCase();
+      if(v!=="truck" && v!=="trailer"){ await send(chat,"Choose Unit: truck or trailer.", kbHome()); return; }
       st.draft.assetType=v as any; st.step="unitNumber"; state.set(chat,st);
       await send(chat, v==="truck"?"Enter <b>truck #</b>.":"Enter <b>trailer #</b>.", kbRemove()); break;
     }
     case "unitNumber":{
-      const num=text.trim(); if(!num){ await send(chat,"Enter a valid number."); return; }
+      const num=t; if(!num){ await send(chat,"Enter a valid number."); return; }
       if(st.draft.assetType==="truck"){
         st.draft.truckNo=num; st.draft.asset=asset(st.draft); st.step="repair"; state.set(chat,st);
         await send(chat,"Describe the <b>issue</b> (Repair).");
@@ -91,27 +107,27 @@ async function onText(chat:number, from:any, text:string){
       } break;
     }
     case "linkTruck":{
-      const num=text.trim(); if(!num){ await send(chat,"Enter truck #."); return; }
+      const num=t; if(!num){ await send(chat,"Enter truck #."); return; }
       st.draft.truckNo=num; st.draft.asset=asset(st.draft); st.step="repair"; state.set(chat,st);
       await send(chat,"Describe the <b>issue</b> (Repair)."); break;
     }
     case "repair":{
-      st.draft.repair=text.trim(); st.step="paidby"; state.set(chat,st);
+      st.draft.repair=t; st.step="paidby"; state.set(chat,st);
       await send(chat,"Paid by?", kbPaid()); break;
     }
     case "paidby":{
-      const v=text.trim().toLowerCase();
+      const v=t.toLowerCase();
       if(v!=="driver" && v!=="company"){ await send(chat,"Choose: driver or company.", kbPaid()); return; }
       st.draft.paidBy=v as any; st.step="total"; state.set(chat,st);
       await send(chat,"Total amount (e.g. 59.20).", kbRemove()); break;
     }
     case "total":{
-      const n=text.replace(",",".").replace(/[^\d.]/g,""); if(!n||Number.isNaN(Number(n))){ await send(chat,"Enter a valid number, e.g. 59.20"); return; }
+      const n=t.replace(",",".").replace(/[^\d.]/g,""); if(!n||Number.isNaN(Number(n))){ await send(chat,"Enter a valid number, e.g. 59.20"); return; }
       st.draft.total=String(Number(n)); st.step="notes"; state.set(chat,st);
       await send(chat,"Notes (optional). Send text or '-' to skip."); break;
     }
     case "notes":{
-      st.draft.comments = text.trim()==="-" ? "" : text.trim();
+      st.draft.comments = t==="-" ? "" : t;
       st.step="invoice"; state.set(chat,st);
       await send(chat,"Send invoice (photo or PDF).", kbRemove());
       await send(chat," ", kbDash());
@@ -169,7 +185,9 @@ async function onFile(chat:number, from:any, msg:any){
 
     state.set(chat,{step:"done",draft:{}});
     await edit(chat, mid, "Saved.");
-    await send(chat, "New report ready.", kbNew());
+    // Возвращаем домашнюю клавиатуру с New report + Dashboard
+    await send(chat, "Choose next action:", kbHome());
+    // И дублируем инлайн-кнопку с URL
     await send(chat, " ", kbDash());
   }catch(e){
     console.error("upload error:", e);
