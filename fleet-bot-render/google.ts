@@ -1,4 +1,4 @@
-// Minimal JWT auth + Drive upload + Sheets append
+// Minimal JWT auth + Drive upload + Sheets append (Shared Drive ready)
 const GOOGLE_CLIENT_EMAIL = Deno.env.get("GOOGLE_CLIENT_EMAIL") ?? "";
 const GOOGLE_PRIVATE_KEY = (Deno.env.get("GOOGLE_PRIVATE_KEY") ?? "").replace(/\\n/g, "\n");
 
@@ -27,6 +27,7 @@ export async function createAccessToken(): Promise<string> {
   const now = Math.floor(Date.now()/1000);
   if (cachedToken && cachedToken.exp - 60 > now) return cachedToken.token;
   const scope = [
+    "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/spreadsheets",
   ].join(" ");
@@ -45,6 +46,7 @@ export async function createAccessToken(): Promise<string> {
 }
 
 export async function driveUpload(args: { accessToken: string; folderId: string; name: string; mimeType: string; bytes: Uint8Array; }) {
+  // parents=[shared-drive-folder-id], supportsAllDrives=true
   const metadata = { name: args.name, parents: [args.folderId] };
   const boundary = "deno-"+crypto.randomUUID();
   const body = new Blob([
@@ -57,7 +59,7 @@ export async function driveUpload(args: { accessToken: string; folderId: string;
     `--${boundary}--`
   ], { type: "multipart/related; boundary="+boundary });
 
-  const res = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", {
+  const res = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true", {
     method: "POST",
     headers: { Authorization: `Bearer ${args.accessToken}` },
     body,
@@ -68,7 +70,7 @@ export async function driveUpload(args: { accessToken: string; folderId: string;
 }
 
 export async function driveMakePublic(args: { accessToken: string; fileId: string; }) {
-  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${args.fileId}/permissions`, {
+  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${args.fileId}/permissions?supportsAllDrives=true`, {
     method: "POST",
     headers: { Authorization: `Bearer ${args.accessToken}`, "content-type": "application/json" },
     body: JSON.stringify({ role: "reader", type: "anyone" }),
